@@ -1,0 +1,193 @@
+---
+title: "Overview"
+author: "Eli Felts"
+date: "9/29/2021"
+output: html_document
+---
+
+
+## IDFG Adult Chinook Reporting
+
+This purpse of this document is to help the next person navigate the available data to get the things they need. The data used to generate the products we use in reporting and other arenas come from a variety of data sources, and each one of them have some quirks that makes it a little challenging to ensure the correct data are being used. I have used R to do all of this. This project will include a narrative and associated R code. It should be relatively painless to implement this R code and that's the route I would recommend. However, I'm trying to write the descriptions here so that if future biologists prefer a different software that the narrative will give them a good understanding of what they need to do. 
+
+## Data Sources
+
+There are several data types that get used in our Chinook reporting. This includes redd counts, carcass collections, and PIT tag queries which represent live fish. For the most part we obtain these data from the SQL databases through live links in Excel work books. A brief rundown of where those are stored are as follows.
+
+* Redd Counts
+  + SGS (Spawning Ground Survey); Live Link: "SGS_ReddCounts_Felts_LiveLink.xlsx"
+  + My own collection of redds for Middle Fork Salmon River complete counts - just an Excel file: "MFSR_Waypoints_CompleteRecord.csv"
+  
+* Carcass Collections
+  + SGS (Spawning Ground Survey); Live Link: "SGS_Carcass_LiveLink.xlsx"
+  + Biosamples; Live Link: "BioSamples_Felts_LiveLink.xlsx"
+  
+* Live fish represented by PIT tags
+  + PIT tag query created by Micah Davison and Paul Bunn; live link: "LGR_ACHNK_PIT_Array_ScaleAge_Felts.xlsx"
+  
+There is also a supplements that essentially just adds supporting metadata for both transects and populations.
+
+* Supplemental information in Excel file: "static_data.xlsx"
+
+Within this project directory all of those files are located within the "data" subfolder.
+
+## Loading R packages
+
+The steps to read in and analyze data will require a number of R packages. If you're not sure that these packages are installed on your computer you can run the following code.
+
+```{r eval=F}
+install.packages(c("tidyverse","readxl","FSA"))
+```
+
+Once those packages are on your computer you can load them into the current R session with the following code.
+
+```{r message=F}
+library(tidyverse)
+library(readxl)
+library(FSA)
+```
+
+The next step is to read in the raw data from the SGS Redd Count database live link. Rather that just reading in that table as is, my code will read it in and perform a number of filters and other steps to make the data cleaner to work with. This is done to reduce the size of the table in the current R session, and to get columns treated as their proper data type. 
+The steps that follow that will work to summarize redd counts by spawn year at the scale of populations. This core piece is used in a large portion of the tables, figures, and summary values which are used to report annual observations and temporal trends.
+
+The code following this paragraph will do a number of things including:
+
+1. Read in the data table from the SGS Redd Count Database live link
+2. Specify the class, or data type, of the values in each column
+3. Filter by "Species" to get only "SP/SU Chinook"; this gets rid of any surveys targeting anything besides Spring-Summer Chinook
+4. Filter by "SurveyNotDoneYN" to get only "False"; this will git rid of records that are holding a place for missing surveys
+5. Filter by "SGR_Transect" to onmly get rows where this column is not blank. This will retrieve only index transects which form the basis for the main chapter in the annual Adult Chinook report.
+6. Replace "NA" values in the "TotalNew" and "TotalPrevious" columns with "0". This is because any survey still remaining actually looked for redds so an NA should not be possible in those 2 columns which represent redds counted. These should actually be represented as having counted 0 redds.
+7. Drop unused factor levels; this is a data cleaning step that will affect summarization in future steps.
+8. Group by "SGR_Transect" and "SurveyYear" to be able to compute summaries within these levels.
+9. Calculate summary values:
+  + "startdate" as the minimum of "StartDate"
+  + "enddate" as the maximum of "EndDate"
+  + "method as the first value of "SampleMethod" - they should all be the same within groups
+  + "TRT_POP" as the first value of "TRT_POP" - they should all be the same within groups
+  + "newredds" as the sum of "TotalNew", and ignoring any NA values
+  + "previousredds" as the sum of "TotalPrevious" and ignoring any NA values
+  + "Redds" as the sum of "newredds" and "previousredds"
+  + "agency" as the first value of "Agency" - they should all be the same within groups
+  + Specify that "startdate" and "enddate" columns are in a date format
+  
+```{r message=F}
+sgs_index_redds_transect <- read_excel("data/SGS_ReddCounts_Felts_LiveLink.xlsx",
+                                       sheet="Data",
+                                       col_types = c("text","skip","skip","text","skip",
+                                                     "skip","skip","skip","skip","text",
+                                                     "skip","skip","numeric","text","skip",
+                                                     "skip","skip","skip","skip","skip",
+                                                     "skip","text","text","text","text",
+                                                     "numeric","numeric","skip","skip","skip",
+                                                     "skip","skip","skip","skip","skip",
+                                                     "skip","skip","skip","skip","skip",
+                                                     "skip","skip","skip","skip","skip",
+                                                     "skip","skip","skip","skip","skip",
+                                                     "skip","skip","skip","skip","skip",
+                                                     "skip","skip")) %>%
+  filter(Species=="SP/SU Chinook"&
+           SurveyNotDoneYN=="False"&
+           !SGR_Transect=="") %>%   
+  mutate(TotalNew = replace(TotalNew,is.na(TotalNew),0),
+         TotalPrevious=replace(TotalPrevious,is.na(TotalPrevious),0)) %>% 
+  droplevels() %>% 
+  group_by(SGR_Transect,SurveyYear) %>% 
+  summarize(startdate=min(StartDate),
+            enddate=max(EndDate),
+            method=first(SampleMethod),
+            TRT_POP=first(TRT_POP),
+            newredds=sum(TotalNew,na.rm=TRUE),
+            previousredds=sum(TotalPrevious,na.rm=TRUE),
+            Redds=newredds+previousredds,
+            agency=first(Agency)) %>% 
+  mutate(startdate=as.Date(startdate),
+         enddate=as.Date(enddate)) 
+```
+
+We now have a data frame in the R workspace that is names "sgs_index_redds_transect". This is sort of an intermediate step that is the rawest form of the redd count data we'll deal with in the R session. 
+
+The next step is to read in some static transect information
+
+```{r message=FALSE}
+ transects_static <- read_excel("data/static_data.xlsx",sheet="transects")
+```
+
+Now that the transect static data are read in we can combine with the raw redd count data from SGS and aggregate redd counts to the population scale. This is typically the scale at which reporting occurs.The code following this paragraph does a number of things including:
+
+ 1. Join the static transect data to the sgs redd count transect summaries by the field "SGR_Transect".
+ 2. Ungroup variables that were grouped in the summary process for transects
+ 3. Specify that "length_km" is a numeric variable
+ 4. Specify that "TRT_POP" and "SurveyYear" are factors - this is necessary so that in the next step we can have all possible combination of these 2 variables returned. If this isn't done then years in which a given population does not have any redd will not show up.
+ 5. Group by "SurveyYear" and TRT_POP" and specify that all possible combinations are returned in the output.
+ 6. Calculate summary values including:
+  + "Redds" as the sum of "Redds", ignoring NA values
+  + "length_km" as the sum of "length_km", ignoring NA values
+  + "startdate" as the minimum of "startdate"
+  + "enddate" as the maximum of "enddate"
+  + "sgs_rows" as the number of rows
+7. Search for records where there were no surveys done and assign a 0 in "sgs_rows" for those instances and an NA to "redds
+8. Drop the "sgs_rows" column
+
+```{r message=F, warning=F}
+
+sgs_index_redds_pop <- sgs_index_redds_transect %>% 
+    left_join(transects_static,by="SGR_Transect") %>% 
+    ungroup() %>% 
+    mutate(length_km=as.numeric(length_km),
+         TRT_POP=as.factor(TRT_POP),
+         SurveyYear=as.factor(SurveyYear)) %>%
+    group_by(SurveyYear,TRT_POP,.drop=FALSE) %>% 
+    summarize(Redds=sum(Redds,na.rm=TRUE),
+            length_km=sum(length_km,na.rm=TRUE),
+            startdate=min(startdate),
+            enddate=max(enddate),
+            sgs_rows=n()) %>% 
+    mutate(Redds=ifelse(sgs_rows==0,NA,Redds)) %>% 
+    select(-c(sgs_rows))
+
+
+```
+
+Another part of the process that is usee in reporting is to calculate historic reference values. These are calculated. from the data frame that was just produced. Steps in this process include:
+
+1. Ungroup variable that were grouped in the summary process for transects
+2. Convert SurveyYear back to a numeric value from being a factor
+3. Filter to get only "SurveyYear" values for 1957-1969
+4. Group by "TRT_POP" to be able to summarize values for the entire "historical" time frame of 1957-1967
+5. Calculate summary values:
+  + "hist_min" ans the minimum of "Redds" ignoring NA values
+  + "hist_max" as the maximum of "Redds" ignoring NA values
+  + "hist_years" as the number of years in the historical period when the survey occurred as indicated by "Redds" not being NA
+  + "hist_geo_mean" as the geometric mean of "Redds" ignoring NA values
+6. Filter out records where "hist_geo_mean" is NA, which is just dropping records where there was no historical data
+7. Join the historical records to the annual records, and rename "SurveyYear" to "SpawnYear"
+
+```{r warning=FALSE, message=FALSE}
+
+  sgs_index_historical <- sgs_index_redds_pop %>% 
+    ungroup() %>% 
+    mutate(SurveyYear=as.numeric(as.character(SurveyYear))) %>% 
+    filter(SurveyYear<1970) %>% 
+    group_by(TRT_POP) %>% 
+      summarize(hist_min=min(Redds,na.rm=TRUE),
+            hist_max=max(Redds,na.rm=TRUE),
+            hist_years=sum(!is.na(Redds)),
+            hist_geo_mean=exp(mean(log(Redds),na.rm=TRUE))) %>% 
+    filter(!is.na(hist_geo_mean))
+
+  pop_redds_base <- left_join(sgs_index_redds_pop,sgs_index_historical,by="TRT_POP") %>% 
+    rename(SpawnYear=SurveyYear)
+
+```
+
+At this point the redds are summarized by spawn year for index transects at the population scale and have their associated historical reference values. Now carcass and PIT tag data will be used to compute age composition and hatchery fraction by spawn year at the population scale.
+
+The first step is to read in static population information
+
+```{r warning=FALSE, message=FALSE}
+
+pops_static <- read_excel("data/static_data.xlsx", sheet="pops")
+
+```
+
