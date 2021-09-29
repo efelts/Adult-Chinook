@@ -1,8 +1,10 @@
 ---
-title: "Overview"
+title: "Generating Spawn Year Data"
 author: "Eli Felts"
 date: "9/29/2021"
-output: html_document
+output:
+  html_document: default
+  pdf_document: default
 ---
 
 
@@ -36,7 +38,7 @@ Within this project directory all of those files are located within the "data" s
 The steps to read in and analyze data will require a number of R packages. If you're not sure that these packages are installed on your computer you can run the following code.
 
 ```{r eval=F}
-install.packages(c("tidyverse","readxl","FSA"))
+install.packages(c("tidyverse","readxl","FSA", "lubridate"))
 ```
 
 Once those packages are on your computer you can load them into the current R session with the following code.
@@ -45,6 +47,7 @@ Once those packages are on your computer you can load them into the current R se
 library(tidyverse)
 library(readxl)
 library(FSA)
+library(lubridate)
 ```
 
 The next step is to read in the raw data from the SGS Redd Count database live link. Rather that just reading in that table as is, my code will read it in and perform a number of filters and other steps to make the data cleaner to work with. This is done to reduce the size of the table in the current R session, and to get columns treated as their proper data type. 
@@ -190,4 +193,519 @@ The first step is to read in static population information
 pops_static <- read_excel("data/static_data.xlsx", sheet="pops")
 
 ```
+
+Next, the raw data from the SGS Carcass table live link is read in. Just like with the redd count table, this code handles the data a little bit on the front end to make for a smaller table with better formatting in the R workspace.
+
+The code following this paragraph will do a number of things including:
+
+1. Read in the SGS Carcass table
+2. Specify the class, or data type, of the values in each column
+3. Filter by "Species" to get only "SP/SU Chinook"
+4. Filter by "CarcassYN" as "TRUE" to only get carcass records; this database has other fish records in it, such as live fish, so it's necessary to specify that we only want carcasses.
+5. Expand by the NFish column, so that each individual fish has its own row. In the database a row can represent one fish, e.g. NFish > 1.
+6. Specify the "SurveyYear" and TRT_POP" variables as factors. This is necessary for the next step
+7. Group by "SurveyYear" and "TRT_POP" and specify that each possible combination of these are returned in the object even if they don't occur in the query. This is necessary to get 0 values in years where a given population has no carcasses.
+8. Calculate summary values for each survey year at the population scale:
+  + "Hatchery" as the number of fish where "ProductionType" is "Hatchery"
+  + "Natural" as the number of fish where "ProductionType" is "Natural"
+  + "Unknown" as the number of fish where "ProductionType" is "Unknown"
+  + "All" as the total number of fish
+  + "Known" as the number of fish where "ProductionType" is not "Unknown"
+  + "Hatchery_Fraction" as "Hatchery" divided by "Known"
+9. Rename "SurveyYear to "SpawnYear"
+
+```{r warning=F, message=F}
+
+carcass_pop_base <- read_excel("data/SGS_Carcass_LiveLink.xlsx",sheet="ViewAllFishSGR",
+                              col_types=c("skip","skip","text","skip","skip",
+                                          "skip","skip","skip","skip","skip",
+                                          "skip","text","skip","skip","skip",
+                                          "skip","skip","skip","skip","skip",
+                                          "numeric","skip","skip","skip","skip",
+                                          "logical","skip","skip","skip","skip",
+                                          "skip","skip","skip","text","skip",
+                                          "skip","skip","skip","skip","skip",
+                                          "skip","skip","skip","skip","skip",
+                                          "skip","skip","skip","skip","skip",
+                                          "text","skip","skip","skip","skip")) %>% 
+    filter(Species=="SP/SU Chinook",CarcassYN==TRUE) %>% 
+    uncount(weights=NFish) %>% 
+    mutate(SurveyYear=as.factor(SurveyYear),
+         TRT_POP=as.factor(TRT_POP)) %>% 
+  group_by(SurveyYear,TRT_POP,.drop=FALSE) %>% 
+    summarize(Hatchery=sum(ProductionType=="Hatchery"),
+            Natural=sum(ProductionType=="Natural"),
+            Unknown=sum(ProductionType=="Unknown"),
+            All = n(),
+            Known = sum(!ProductionType=="Unknown"),
+            Hatchery_Fraction=(Hatchery/Known)) %>% 
+  rename(SpawnYear=SurveyYear)
+```
+
+That completes the steps needed to calculate hatchery fraction at the scale of populations buy spawn year. 
+
+Next there is a fairly long prcess to calculate age composition. This process is a little more lengthy because age information comes from several different sources, and an age-length key is used to assign ages to fish with a length but no age estimate.
+
+First, a reference sheet is read in to be associated with the PIT array query
+
+```{r warning=F, message=F}
+ptagis_ref <- read_csv("data/ptagis_sites.csv") %>% 
+  arrange(pit_table_order) 
+```
+
+Next, read in the live link to the PIT array query. This query searches at arrays where we can reasonable assume that we know which population an adult detection is associated with. Most of the PIT tag detections will have an associated age estimate because they would have either been encountered at Lower Granite Dam as an adult and had a scale sample taken, or been tagged as a juvenile at a screw trap when age could be assumed to be known. Just like the other data sources used previously, the process of reading in these data is combined with a few other intermediate steps to reduce memory usage and improve formatting for subsequent steps; in a lot of these cases the formatting is done to make the data frames that come from various data sources all have the same structure with common names for variables describing the same things.
+
+Specific initial steps performed on the PIT array query include:
+
+1. Read in the live link to the PIT array query
+2. Make a "latitude" column with values all NA
+3. Make a "longitude" column with values all NA
+3. Make a "method" column with values of "PIT_scale"
+4. Make a "prod_type" column based on "GenRear"; if that value is "H" then "prod_type" becomes "Hatchery", otherwise it becomes "Natural".
+5. Make an "age" column that converts "BioScaleFinalAge", which is in a FW:SW age format, to total age.
+6. Rename "LGDFLmm" to "fork_length"
+7. Rename "GenSex" to "sex"
+8. Rename "Total" to "n"
+9. Rename "LGDNumPit" to "PIT_id"
+10. Reduce columns to: year, n, PIT_id, fork_length, sex, prod_type, latitude, longitude, age, method, PtagisEventLastSpawnSite
+11. Filter for “prod_type” of “Natural”; Filter for age to have an actual value, i.e. does not equal NA
+12. Join to the PTAGIS sites reference static data such that all fish in the query are retained
+13. Rename “TRT_POP” to “pop"
+14. Filter out rows with NA for Population
+15. Limit to columns: year, PIT_id, fork_length, sex, prod_type, latitude, longitude, age, method, mpg, pop, pop.abb, basin
+
+```{r warning=F, message=F}
+
+pit_ages <- read_excel("data/LGR_ACHNK_PIT_Array_ScaleAge_Felts.xlsx",
+                       sheet="AdultCHNK_PITarrayPivot",skip=10) %>% 
+    mutate(year=year(PtagisLastEventDate),
+         latitude=NA,
+         longitude=NA,
+         method="PIT_Scale",
+         prod_type=ifelse(GenRear=="H",
+                          "Hatchery","Natural"),
+         age=ifelse(BioScaleFinalAge=="0:1"|
+                      BioScaleFinalAge=="2:MJ",2,
+                    ifelse(BioScaleFinalAge=="1:1"|
+                             BioScaleFinalAge=="0:2",3,
+                           ifelse(BioScaleFinalAge=="1:2"|
+                                    BioScaleFinalAge=="2:1"|
+                                    BioScaleFinalAge=="0:3",4,
+                                  ifelse(BioScaleFinalAge=="1:3"|
+                                           BioScaleFinalAge=="2:2",5,
+                                         ifelse(BioScaleFinalAge=="2:3",6,
+                                                NA)))))) %>% 
+   rename(fork_length=LGDFLmm,
+         sex=GenSex,
+         n=Total,
+         PIT_id = LGDNumPIT) %>% 
+    select(year,n,PIT_id,fork_length,sex,prod_type,latitude,
+         longitude,age,method,PtagisEventLastSpawnSite) %>% 
+    filter(prod_type=="Natural"&
+           !is.na(age)) %>%
+  left_join(ptagis_ref,
+            by=c("PtagisEventLastSpawnSite"="PTAGIS Site Code")) %>% 
+  rename(pop=TRT_POP) %>% 
+  filter(!is.na(Population))%>%  
+    select(year,PIT_id,fork_length,sex,prod_type,latitude,longitude,
+         age,method,mpg,pop,pop.abb,basin)
+```
+
+For now we have what we need from the PIT array query. Next we will read in and do some formatting with SGS carcass data. We've already read in from this live link once but here we start over because we're going a different direction with those initial data.
+
+Specific initial steps performed on the SGS carcass data include:
+
+1. Read in the SGS Carcass table
+2. Specify the class, or data type, of the values in each column
+3. Filter by "Species" to get only "SP/SU Chinook"
+4. Filter by "CarcassYN" as "TRUE" to only get carcass records; this database has other fish records in it, such as live fish, so it's necessary to specify that we only want carcasses.
+5. Expand by the NFish column, so that each individual fish has its own row. In the database a row can represent one fish, e.g. NFish > 1.
+6. Rename “SurveyYear” to “year”
+7. Rename “ForkLength” to “fork_length”
+8. Rename “Sex” to “sex”
+9. Rename “ProductionType” to “prod_type”
+10. Rename “Latitude” to “latitude”
+11. Rename “Longitude” to “longitude”
+12. Rename “Age” to “age”
+13. Rename “AgingMethod” to “method”
+14. Rename “TRT_MPG” to “mpg”
+15. Rename “TRT_POP” to “pop”
+16. Rename “FinRaySampleNumber” to “Sample Number”
+17. Rename “PITCode” to PIT_id”
+18. Limit to columns: SampleNumber, year, fork_length, sex, prod_type, latitude, longitude, age, method, mpg, pop, PIT_id
+19. Search “age” column for “-99” and switch those instances to “NA”; searc fork_length column for “-99” and switch those instances to “NA”
+20. Search fork_length column for values less than 130, and multiply by 10; this is because some records were entered in centimeters when they should be in millimeters. This assumes that any values less than 130 are cm, and converts them to millimeters.
+21. Join to static pops data such that all fish in the query are retained
+22. Limit to columns: year, PIT_id, fork_length, sex, prod_type, latitude, longitude, age, method, mpg, pop, pop.abb, basin
+23. Filter for “prod_type” of “Natural”
+24. Filter to keep only rows where age is NA – this is done with the SGS data because the only fish we end up using are those which have a length but no age estimate; any fish in SGS that have an age estimate are also in Biosamples
+25. Filter out any fish where fork_length is NA
+26. Filter out fish with fork_length <391; There are some weird records in SGS from the 1980s that I think are actually entered in inches. I’m unsure what exactly they are so this step eliminates those fish from any future analysis
+
+```{r warning=F, message=F}
+sgs_ages <- read_excel("data/SGS_Carcass_LiveLink.xlsx",sheet="ViewAllFishSGR",
+                       col_types=c("skip","skip","text","skip","skip",
+                                   "skip","skip","skip","skip","skip",
+                                   "skip","text","skip","skip","skip",
+                                   "skip","skip","skip","skip","skip",
+                                   "numeric","numeric","skip","skip","skip",
+                                   "logical","skip","skip","skip","skip",
+                                   "skip","text","skip","text","skip",
+                                   "skip","numeric","numeric","skip","skip",
+                                   "skip","skip","skip","skip","text",
+                                   "skip","numeric","text","skip","text",
+                                   "text","skip","skip","skip","text")) %>% 
+  filter(Species=="SP/SU Chinook",CarcassYN==TRUE) %>% 
+  uncount(weights=NFish) %>% 
+  rename(year=SurveyYear,
+         fork_length=ForkLength,
+         sex=Sex,
+         prod_type=ProductionType,
+         latitude=Latitude,
+         longitude=Longitude,
+         age=Age,
+         method=AgingMethod,
+         mpg=TRT_MPG,
+         pop=TRT_POP,
+         SampleNumber=FinRaySampleNumber,
+         PIT_id=PITCode) %>% 
+  select(c(SampleNumber,year,fork_length,sex,prod_type,latitude,longitude,
+           age,method,mpg,pop,PIT_id)) %>% 
+  mutate(age=ifelse(age==-99,NA,age),
+         fork_length=ifelse(fork_length==-99,NA,fork_length)) %>% 
+  mutate(fork_length=ifelse(fork_length<130,(fork_length*10),fork_length)) %>% 
+  left_join(pops_static,by=c("pop"="TRT_POP")) %>% 
+  select(c(year,PIT_id,fork_length,sex,prod_type,latitude,longitude,
+           age,method,mpg,pop,pop.abb,basin)) %>% 
+  filter(prod_type=="Natural"&
+           is.na(age)&
+           !is.na(fork_length)&
+           fork_length>390)
+
+```
+
+Next, the Biosamples data are read in. Steps for initial processing include:
+
+1. Read in Biosamples live link
+2. Filter by "Species" equals 1, which corresponds to Spring-Summer Chinook
+3. Rename "Year" to year"
+4. Rename "NumPIT" to "PIT_id"
+5. Rename "ForkLengthmm" to "fork_length"
+6. Rename "SEX" to "sex"
+7. Rename "Latitude" to latitude"
+8. Rename "Longitude" to "longitude"
+9. Rename "CHNBasin" to "pop_biosamples"
+10. Assign "prod_type" based on "RearType". If "RearType" is "W" or "NI", then "prod_type" is "Natural", otherwise it is "Hatchery"
+11.  Make an "age" column that converts "FinFinalAge", which is in a FW:SW age format, to total age.
+12. Assign "method" as "fin"
+13. Join to static pops data such that all fish in the query are retained
+14. Limit to columns: year,PIT_id,fork_length,sex,prod_type,latitude,longitude,age,method,TRT_MPG,TRT_POP,pop.abb,basin
+15. Filter for "prod_type" of "Natural"
+16. Filter out fish with NA for "age"
+17. Filter out fish less than 390 mm in "fork_length"
+18. Filter out fish with NA for "fork_length"
+19. Rename "TRT_MPG" to "mpg"
+20. Rename "TRT_POP" to "pop"
+  
+
+```{r}
+biosamples_ages <- read_excel("data/Biosamples_Live_Link_Eli_Fins.xlsx") %>% 
+  filter(Species==1) %>% 
+  rename(year=Year,
+         PIT_id=NumPIT,
+         fork_length=ForkLengthmm,
+         sex=SEX,
+         latitude=Latitude,
+         longitude=Longitude,
+         pop_biosamples=CHNBasin) %>% 
+  mutate(prod_type=ifelse(RearType=="W"|
+                            RearType=="NI","Natural","Hatchery"),
+         age=ifelse(FinFinalAge=="0:1"|
+                      FinFinalAge=="2:MJ",2,
+                    ifelse(FinFinalAge=="1:1"|
+                             FinFinalAge=="0:2",3,
+                           ifelse(FinFinalAge=="1:2"|
+                                    FinFinalAge=="2:1"|
+                                    FinFinalAge=="0:3",4,
+                                  ifelse(FinFinalAge=="1:3"|
+                                           FinFinalAge=="2:2",5,
+                                         ifelse(FinFinalAge=="1:4"|
+                                                  FinFinalAge=="2:3",6,
+                                                NA))))),
+         method="fin") %>% 
+  left_join(pops_static,by="pop_biosamples") %>% 
+  select(year,PIT_id,fork_length,sex,prod_type,latitude,longitude,age,
+         method,TRT_MPG,TRT_POP,pop.abb,basin) %>% 
+  filter(prod_type=="Natural"&
+           !is.na(age)&
+           fork_length>390|
+           is.na(fork_length)) %>% 
+  rename(mpg=TRT_MPG,
+         pop=TRT_POP)
+```
+
+Now the three data sources for age composition are in the R workspace. The next step is to find any fish that may be duplicated among those three sources. One scenario which may have duplicates is fish that showed up in the PIT tag query that were also collected from carcasses on the spawning grounds and have an associated fin ray age estimate, which means they would be in Biosamples. So, in this next line of code we look for any PIT ids that are in both the pit_ages and biosamples_ages data frames, and drop them from the pit_age data frame. This effectively means that we're deciding to use the fin ray age estimate for these fish instead of the scale age estimate. In this step we're also assigning the remaining fish a "method" of "scale"
+
+```{r warning=F, message=F}
+ pit_ages_pit_filtered <- anti_join(pit_ages,biosamples_ages,by="PIT_id") %>% 
+    mutate(method="scale")
+
+```
+
+The other scenario which may produce duplicates is fish that showed up in the PIT tag query that were also collected from carcasses on the spawning grounds but for one reason or another only have a length but no fin ray age estimate, which means they would be in the sgs_ages data frame. So, in this next line of code we look for any PIT ids that are in both the pit_ages and sgs_ages data frames, and drop them from the sgs_ages data frame. This effectively means that we're deciding to use the scale age estimate for these fish instead of the an age estimate assigned from an age-length key. In this step we're also assigning the remaining fish in sgs_ages a "method" of "length".
+
+```{r warning=F, message=F}
+sgs_pit_filtered <-anti_join(sgs_ages,pit_ages,by="PIT_id") %>% 
+    mutate(method="length")
+```
+
+Now the three separate sources of age composition data should each have only unique fish so they can be joined together. Previous steps have made it so they all have the same columns so here they are easily combined into a single data frame.
+
+```{r warning=F, message=F}
+carcs_joined <- rbind(biosamples_ages,pit_ages_pit_filtered,sgs_pit_filtered) 
+```
+
+Next, we go through the process of assigning ages to fish based on an age-length key. First, filter from the complete data set to only get fish that don’t have an NA for fork_length. There will be some fish with NA for fork_length which do have an age estimate, because sometimes fish are found on the spawning grounds that are too decomposed to accurately measure length, but the fin ray is in good enough condition to get an age estimate.
+
+```{r warning=F,message=FALSE}
+carcs_length <- carcs_joined %>% 
+  filter(!is.na(fork_length))
+```
+
+Now, there are several steps to get produce the age-length key which include:
+
+1. Assign each fish to a length category. Bin width will be 50 mm, and start at 350 mm
+2. Make a separate data frame of aged fish by filtering out records with an NA for “age”.
+3. Make a separate data frame of unaged fish by filtering out records that do not have an NA for “age”
+4. Make a proportion table with the proportions by age within each length category
+5. Use the proportion table and Derek Ogle’s function in the FSA package to assign ages to each individual in the unaged sample. Essentially what this step is doing is generating a multinomial likelihood for age within each length category. Then, to assign ages to individual fish it is drawing a single sample from the multinomial likelihood associated with that fish’s length category. For example, the proportion table may say that a fish in the 751-800 mm length category has a probability of .02 of being age 3, a probability of 0.72 of being age 4, and a probability of 0.26 of being age 5; so, if we’re assigning an age to a fish that was 770 mm, we will draw a sample from those probabilities.
+  + NOTE that currently this applies an age-length key that is generated from all available years of data. This should probably be changed so that a separate key is applied annually
+7. Drop the "LCat" column
+8. Those fish with the assigned ages are bound to the complete Biosamples and PIT age samples to construct the combined age sample.
+
+```{r message=F, warning=F}
+carcs_lcat <- lencat(~fork_length,data=carcs_length,startcat=350,w=50)
+
+aged <- carcs_lcat %>% 
+    filter(!is.na(age)) 
+
+unaged <- carcs_lcat %>% 
+  filter(is.na(age))
+
+d.raw <- xtabs(~LCat+age,data=aged)
+d.key <- prop.table(d.raw,margin=1)
+
+unaged_assignment <- alkIndivAge(d.key,~fork_length,data=unaged) %>% 
+    select(-c(LCat))
+
+aged_combined <- rbind(biosamples_ages,pit_ages_pit_filtered,unaged_assignment)
+```
+
+At this point there is an intermediate step that grabs the data that are specific to one plot that is typically made in the annual report. This figure generates a length-frequency distribution by age, and will use data from directly aged fish ("method" of "scale" or "fin") in a format where they are not summarized, so rows represent individual fish.
+
+```{r message=F, warning=F}
+aged_direct <- aged_combined %>% 
+  filter(method=="scale"|
+           method=="fin")
+```
+
+Now do some summarization of age compostion at the population scale. This process follows these steps:
+
+1. Convert "year" and "pop.abb" to factors
+2. Group by “year” and “pop.abb”, and make sure that all possible combinations of these are returned in the output, even if they don't occur. This will still make sure that a record is generated for that pop.abb/year combination. Even if there were no samples at the population scale, we will eventually assign age composition from a broader scale. 
+3. Calculate summary values:
+  + n_pop” as the number of samples
+  + "n_fins_pop” as the number of samples aged by fin ray
+  + “n_scale_pop” as the number of samples aged by scale
+  + “n_length_pop” as the number of samples aged by assignment based on length
+  + "n_direct_pop" as the sum of “n_fins_pop” and “n_scale_pop”
+  + "age3_pop" as the number of age 3 fish
+  + "age4_pop" as the number of age 4 fish
+  + "age5_pop" as the number of age 5 fish
+  + "age6_pop" as the number of age 6 fish
+  + “age3prop_pop” as the number of age 3 fish divided by “n_pop”
+  + “age4prop_pop” as the number of age 4 fish divided by “n_pop”
+  + “age5prop_pop” as the number of age 5 fish divided by “n_pop”
+  + “age6prop_pop” as the number of age 6 fish divided by “n_pop”
+4. Join to the static “pops” data such that all year/pop.abb combinations are retained
+5. Add a new column of “state” which will be “id” for all rows
+6. Limit to columns: year, pop.abb, mpg.abb, state, n_pop, n_fins_pop, n_scale_pop, n_direct_pop, age3prop_pop, age4prop_pop, age5prop_pop, and age6prop_pop
+
+```{r message=F, warning=F}
+agecomps.pop <- aged_combined %>% 
+  mutate(year=as.factor(year),
+         pop.abb=as.factor(pop.abb)) %>% 
+  group_by(year,pop.abb,.drop=FALSE) %>% 
+  summarize(n_pop=n(),
+            n_fins_pop=sum(method=="fin"),
+            n_scale_pop=sum(method=="scale"),
+            n_length_pop=sum(method=="length"),
+            n_direct_pop=(n_fins_pop+n_scale_pop),
+            age3_pop=sum(age==3),
+            age4_pop=sum(age==4),
+            age5_pop=sum(age==5),
+            age6_pop=sum(age==6),
+            age3prop_pop=sum(age==3)/n_pop,
+            age4prop_pop=sum(age==4)/n_pop,
+            age5prop_pop=sum(age==5)/n_pop,
+            age6prop_pop=sum(age==6)/n_pop) %>% 
+  left_join(pops_static,by="pop.abb") %>% 
+  mutate(state="id") %>% 
+  select(c(year,pop.abb,mpg.abb,state,n_pop,n_fins_pop,n_scale_pop,
+           n_length_pop,n_direct_pop,age3_pop,age4_pop,age5_pop,age6_pop,
+           age3prop_pop,age4prop_pop,age5prop_pop,
+           age6prop_pop))
+
+```
+
+
+Now basically do the same thing but compute age composition at the MPG scale. This process follows these steps:
+
+1. Convert "year" and "mpg.abb" to factors
+2. Group by “year” and “mpg.abb”, and make sure that all possible combinations of these are returned in the output, even if they don't occur. This will still make sure that a record is generated for that mpg.abb/year combination. Even if there were no samples at the population scale, we will eventually assign age composition from a broader scale. 
+3. Calculate summary values:
+  + n_mpg” as the number of samples
+  + "n_fins_mpg” as the number of samples aged by fin ray
+  + “n_scale_mpg” as the number of samples aged by scale
+  + “n_length_mpg” as the number of samples aged by assignment based on length
+  + "n_direct_mpg" as the sum of “n_fins_mpg” and “n_scale_mpg”
+  + "age3_mpg" as the number of age 3 fish
+  + "age4_mpg" as the number of age 4 fish
+  + "age5_mpg" as the number of age 5 fish
+  + "age6_mpg" as the number of age 6 fish
+  + “age3prop_mpg” as the number of age 3 fish divided by “n_mpg”
+  + “age4prop_mpg” as the number of age 4 fish divided by “n_mpg”
+  + “age5prop_mpg” as the number of age 5 fish divided by “n_mpg”
+  + “age6prop_mpg” as the number of age 6 fish divided by “n_mpg”
+
+```{r message=F, warning=F}
+  agecomps.mpg <- aged_combined %>%
+  mutate(mpg.abb=ifelse(mpg=="Middle Fork Salmon River","mfsr",
+                        ifelse(mpg=="South Fork Salmon River","sfsr",
+                               ifelse(mpg=="Upper Salmon River","usr",
+                                      ifelse(mpg=="Wet Clearwater","wc",
+                                             ifelse(mpg=="mfsr","mfsr",
+                                                    ifelse(mpg=="sfsr","sfsr",
+                                                           ifelse(mpg=="usr","usr",
+                                                                  ifelse(mpg=="wc","wc","dc"))))))))) %>% 
+  mutate(year=as.factor(year),
+         mpg.abb=as.factor(mpg.abb)) %>% 
+  group_by(year,mpg.abb,.drop=FALSE) %>% 
+  summarize(n_mpg=n(),
+            n_fins_mpg=sum(method=="fin"),
+            n_scale_mpg=sum(method=="scale"),
+            n_length_mpg=sum(method=="length"),
+            n_direct_mpg=(n_fins_mpg+n_scale_mpg),
+            age3prop_mpg=sum(age==3)/n_mpg,
+            age4prop_mpg=sum(age==4)/n_mpg,
+            age5prop_mpg=sum(age==5)/n_mpg,
+            age6prop_mpg=sum(age==6)/n_mpg) 
+```
+
+Now join the population scale age comp to the MPG scale age comp
+
+```{r warning=F, message=F}
+agecomp_join1 <- left_join(agecomps.pop,agecomps.mpg,by=c("mpg.abb","year"))
+```
+
+Next compute age composition at the statewide scale. This process follows these steps:
+
+1. Make "year" a factor
+2. Group by "year"
+3. Calculate summary values:
+  + "n_id” as the number of samples
+  + "n_fins_id” as the number of samples aged by fin ray
+  + “n_scale_id” as the number of samples aged by scale
+  + “n_length_id" as the number of samples aged by assignment based on length
+  + "n_direct_id" as the sum of “n_fins_id" and “n_scale_id”
+  + "age3prop_id” as the number of age 3 fish divided by “n_id”
+  + “age4prop_id” as the number of age 4 fish divided by “n_id”
+  + “age5prop_id” as the number of age 5 fish divided by “n_id”
+  + “age6prop_id” as the number of age 6 fish divided by “n_id”
+4. Add a new column of "state" which will be "id" for all rows
+
+```{r message=F, warning=F}
+ agecomps.id <- aged_combined %>% 
+  mutate(year=as.factor(year)) %>% 
+  group_by(year) %>% 
+  summarize(n_id=n(),
+            n_fins_id=sum(method=="fin"),
+            n_scale_id=sum(method=="scale"),
+            n_length_id=sum(method=="length"),
+            n_direct_id=(n_fins_id+n_scale_id),
+            age3prop_id=sum(age==3)/n_id,
+            age4prop_id=sum(age==4)/n_id,
+            age5prop_id=sum(age==5)/n_id,
+            age6prop_id=sum(age==6)/n_id) %>% 
+  mutate(state="id")
+```
+
+Now join the pop and MPG age comp to the statewide age comp
+
+```{r warning=F, message=F}
+agecomp_join2 <- left_join(agecomp_join1,agecomps.id,by=c("state","year"))
+```
+
+Select an age proportion to use for further analysis. The criteria are: if 20 or more fish are aged within a population, use the the population scale, if less than 20 are aged within a population, use the MPG scale unless there have been less than 20 aged at the MPG scale in which case use the statewide scale. These criteria are applied for each age class to make a new column in the format “ageX_prop”. A couple of additional steps are also applied:
+1. Do some renaming of columns:
+  + "n_fins_pop" to "fin_samples"
+  + "n_scale_pop" to "scale_samples"
+  + "n_length_pop" to "length_samples"
+  + "n_pop" to "total_samples"
+  + "age3_pop" to "age3"
+  + "age4_pop" to "age4"
+  + "age5_pop" to "age5"
+  + "age6_pop" to "age6"
+  + "year" to "SpawnYear"
+2. Join to static population data
+3. Limit to columns: SpawnYear, TRT_POP, fin_samples, scale_samples, length_samples, total_samples, age3, age4, age5, age6, age3_prop, age4_prop, age5_prop, age6_prop, agecomp_scale
+
+```{r warning=F, message=F}
+pop_agecomp_base<- agecomp_join2 %>% 
+  mutate(age3_prop=ifelse(n_pop>19,age3prop_pop,age3prop_mpg),
+         age3_prop=ifelse(n_mpg<20,age3prop_id,age3_prop),
+         age4_prop=ifelse(n_pop>19,age4prop_pop,age4prop_mpg),
+         age4_prop=ifelse(n_mpg<20,age4prop_id,age4_prop),
+         age5_prop=ifelse(n_pop>19,age5prop_pop,age5prop_mpg),
+         age5_prop=ifelse(n_mpg<20,age5prop_id,age5_prop),
+         age6_prop=ifelse(n_pop>19,age6prop_pop,age6prop_mpg),
+         age6_prop=ifelse(n_mpg<20,age6prop_id,age6_prop),
+         agecomp_scale=ifelse(n_pop>19,"pop","mpg"),
+         agecomp_scale=ifelse(n_mpg<20,"state",agecomp_scale)) %>% 
+   rename(fin_samples=n_fins_pop,
+         scale_samples=n_scale_pop,
+         length_samples=n_length_pop,
+         total_samples=n_pop,
+         age3=age3_pop,
+         age4=age4_pop,
+         age5=age5_pop,
+         age6=age6_pop,
+         SpawnYear=year) %>% 
+    left_join(pops_static,by="pop.abb") %>% 
+    select(c(SpawnYear,TRT_POP,fin_samples,scale_samples,length_samples,
+           total_samples,age3,age4,age5,age6,age3_prop,age4_prop,
+           age5_prop,age6_prop,agecomp_scale)) 
+
+```
+
+Now the age composition is complete. Basically all the various pieces for spawn year data at the population scale are done and they just need to be joined together into a single data frame. The steps to do so are:
+
+1. Join the redd data to the carcass data
+2. Join the age comp data in
+3. Join static pouplation data in for some reference columns
+4. Limit to columns: SpawnYear, TRT_POP, pop.abb, table_order_pop, plotting_group, mpg.abb, pop_hatchery, basin, length_km, startdate, enddate, Redds, Hatchery, Natural, Unknown, All, Known, Hatchery_Fraction, fin_samples, scale_samples, length_samples, total_samples, age3, age4, age5, age6, age3_prop, age4_prop, age5_prop, age6_prop, agecomp_scale, hist_min, hist_max, hist_geo_mean
+
+```{r warning=F, message=F}
+sy_pop_base <- left_join(pop_redds_base,carcass_pop_base,by=c("SpawnYear","TRT_POP")) %>% 
+  left_join(pop_agecomp_base,by=c("SpawnYear","TRT_POP")) %>% 
+  left_join(pops_static,by="TRT_POP") %>% 
+    select(c(SpawnYear,TRT_POP,pop.abb,mpg.abb,table_order_pop, plotting_group,
+             pop_hatchery,basin,length_km,startdate,enddate,
+           Redds,Hatchery,Natural,Unknown,All,Known,Hatchery_Fraction,fin_samples,
+           scale_samples,length_samples,total_samples,age3,age4,age5,age6,
+           age3_prop,age4_prop,age5_prop,age6_prop,agecomp_scale,hist_min,hist_max,
+           hist_geo_mean))
+```
+
+Now the spawn year base data frame is complete. Everything after this process can pretty much start with this data frame and get the products needed in a lot less steps. 
 
